@@ -1,0 +1,210 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────
+# QubeticsVPN — macOS Installer postinstall script
+# This script runs automatically during the macOS .pkg installation.
+# It places the Chrome Native Messaging manifest in the right place.
+#
+# DYNAMIC EXTENSION ID DETECTION:
+# Scans all Chrome profiles on the system to find the Qubetics Wallet
+# extension and automatically uses its ID in allowed_origins.
+# Falls back to a known ID if none found.
+# ─────────────────────────────────────────────────────────
+
+# The native host binary path.
+HOST_EXECUTABLE="/Library/Application Support/QubeticsVPN/QubeticsNativeHost"
+
+# Chrome's system-wide directory for Native Messaging Hosts
+CHROME_NMH_DIR="/Library/Google/Chrome/NativeMessagingHosts"
+HOST_NAME="com.qubetics.vpn"
+MANIFEST_DEST="$CHROME_NMH_DIR/$HOST_NAME.json"
+
+# Fallback extension ID (from original developer mode)
+FALLBACK_EXTENSION_ID="oabinpbnodlcmbnohnnbnbjpfkpclhim"
+
+echo "Running QubeticsVPN post-install script..."
+
+# ─────────────────────────────────────────────────────────
+# Dynamic Extension ID Discovery
+# Scans all users' Chrome profiles to find the Qubetics
+# extension and collects ALL unique extension IDs.
+# ─────────────────────────────────────────────────────────
+DISCOVERED_IDS=""
+
+discover_extension_ids() {
+    # Search all user home directories for Chrome profile Preferences
+    for USER_HOME in /Users/*; do
+        [ ! -d "$USER_HOME" ] && continue
+        CHROME_DIR="$USER_HOME/Library/Application Support/Google/Chrome"
+        [ ! -d "$CHROME_DIR" ] && continue
+
+        for PREFS_FILE in "$CHROME_DIR"/*/Preferences; do
+            [ ! -f "$PREFS_FILE" ] && continue
+
+            # Use python3 to parse Chrome's Preferences JSON and find Qubetics extensions
+            IDS=$(python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        prefs = json.load(f)
+    exts = prefs.get('extensions', {}).get('settings', {})
+    for eid, info in exts.items():
+        name = info.get('manifest', {}).get('name', '')
+        if 'qubetics' in name.lower():
+            print(eid)
+except Exception:
+    pass
+" "$PREFS_FILE" 2>/dev/null)
+
+            if [ -n "$IDS" ]; then
+                for ID in $IDS; do
+                    # Add to list if not already present
+                    if ! echo "$DISCOVERED_IDS" | grep -q "$ID"; then
+                        DISCOVERED_IDS="$DISCOVERED_IDS $ID"
+                    fi
+                done
+            fi
+        done
+    done
+
+    # Also check for unpacked extensions loaded from build folders
+    # These show up in Chrome's Extensions directory with their IDs
+    for USER_HOME in /Users/*; do
+        [ ! -d "$USER_HOME" ] && continue
+        CHROME_DIR="$USER_HOME/Library/Application Support/Google/Chrome"
+        [ ! -d "$CHROME_DIR" ] && continue
+
+        for PROFILE_DIR in "$CHROME_DIR"/*/Extensions; do
+            [ ! -d "$PROFILE_DIR" ] && continue
+            for EXT_DIR in "$PROFILE_DIR"/*/; do
+                [ ! -d "$EXT_DIR" ] && continue
+                EXT_ID=$(basename "$EXT_DIR")
+                # Check if this extension has a manifest with "Qubetics" in the name
+                for VERSION_DIR in "$EXT_DIR"/*/; do
+                    [ ! -d "$VERSION_DIR" ] && continue
+                    if [ -f "$VERSION_DIR/manifest.json" ]; then
+                        HAS_QUBETICS=$(python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        m = json.load(f)
+    if 'qubetics' in m.get('name', '').lower():
+        print('yes')
+except:
+    pass
+" "$VERSION_DIR/manifest.json" 2>/dev/null)
+                        if [ "$HAS_QUBETICS" = "yes" ]; then
+                            if ! echo "$DISCOVERED_IDS" | grep -q "$EXT_ID"; then
+                                DISCOVERED_IDS="$DISCOVERED_IDS $EXT_ID"
+                            fi
+                        fi
+                    fi
+                done
+            done
+        done
+    done
+}
+
+discover_extension_ids
+
+# Trim leading/trailing whitespace
+DISCOVERED_IDS=$(echo "$DISCOVERED_IDS" | xargs)
+
+# Always include the fallback ID
+if ! echo "$DISCOVERED_IDS" | grep -q "$FALLBACK_EXTENSION_ID"; then
+    DISCOVERED_IDS="$FALLBACK_EXTENSION_ID $DISCOVERED_IDS"
+fi
+
+# Build the allowed_origins JSON array
+ORIGINS=""
+for ID in $DISCOVERED_IDS; do
+    if [ -n "$ORIGINS" ]; then
+        ORIGINS="$ORIGINS,"$'\n'"        \"chrome-extension://$ID/\""
+    else
+        ORIGINS="\"chrome-extension://$ID/\""
+    fi
+done
+
+echo "Discovered extension IDs: $DISCOVERED_IDS"
+
+# 1. Create the target directory if it doesn't exist
+mkdir -p "$CHROME_NMH_DIR"
+
+# 2. Write the manifest JSON with ALL discovered extension IDs
+cat > "$MANIFEST_DEST" <<EOF
+{
+    "name": "$HOST_NAME",
+    "description": "Native Messaging Host for QubeticsVPN",
+    "path": "$HOST_EXECUTABLE",
+    "type": "stdio",
+    "allowed_origins": [
+        $ORIGINS
+    ]
+}
+EOF
+
+# 3. Set proper permissions for Chrome to read it
+chmod 644 "$MANIFEST_DEST"
+echo "Native Messaging Manifest deployed to $MANIFEST_DEST"
+echo "Manifest contents:"
+cat "$MANIFEST_DEST"
+
+# ─────────────────────────────────────────────────────────
+# Also install per-user manifests for each user (covers cases
+# where the system-level manifest isn't picked up)
+# ─────────────────────────────────────────────────────────
+for USER_HOME in /Users/*; do
+    [ ! -d "$USER_HOME" ] && continue
+    [ "$(basename "$USER_HOME")" = "Shared" ] && continue
+    CHROME_DIR="$USER_HOME/Library/Application Support/Google/Chrome"
+    [ ! -d "$CHROME_DIR" ] && continue
+
+    USER_NMH_DIR="$USER_HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts"
+    mkdir -p "$USER_NMH_DIR"
+    cp "$MANIFEST_DEST" "$USER_NMH_DIR/$HOST_NAME.json"
+
+    # Fix ownership to the actual user
+    USER_NAME=$(basename "$USER_HOME")
+    chown "$USER_NAME" "$USER_NMH_DIR/$HOST_NAME.json" 2>/dev/null
+    chmod 644 "$USER_NMH_DIR/$HOST_NAME.json"
+    echo "Per-user manifest deployed to $USER_NMH_DIR"
+done
+
+# 4. Handle Privileged Helper Tool
+HELPER_BIN="/Library/PrivilegedHelperTools/com.qubetics.vpn.helper"
+HELPER_PLIST="/Library/LaunchDaemons/com.qubetics.vpn.helper.plist"
+
+if [ -f "$HELPER_BIN" ]; then
+    echo "Setting permissions for $HELPER_BIN..."
+    chown root:wheel "$HELPER_BIN"
+    chmod 544 "$HELPER_BIN"
+fi
+
+# ── 5. WireGuard tools permissions ────────────────────────
+WG_BIN_DIR="/Library/Application Support/QubeticsVPN/bin"
+if [ -d "$WG_BIN_DIR" ]; then
+    echo "Setting permissions for WireGuard tools in $WG_BIN_DIR..."
+    chown -R root:wheel "$WG_BIN_DIR"
+    chmod 755 "$WG_BIN_DIR"
+    # Ensure all files are executable (wg, wireguard-go, wg-quick)
+    chmod 755 "$WG_BIN_DIR"/wg "$WG_BIN_DIR"/wireguard-go "$WG_BIN_DIR"/wg-quick 2>/dev/null || true
+fi
+
+# ── 6. Create WireGuard socket directory ─────────────────
+WG_SOCK_DIR="/var/run/wireguard"
+mkdir -p "$WG_SOCK_DIR"
+chown root:wheel "$WG_SOCK_DIR"
+chmod 755 "$WG_SOCK_DIR"
+echo "WireGuard socket directory ensured at $WG_SOCK_DIR"
+
+if [ -f "$HELPER_PLIST" ]; then
+    echo "Setting permissions and loading $HELPER_PLIST..."
+    chown root:wheel "$HELPER_PLIST"
+    chmod 644 "$HELPER_PLIST"
+    
+    # Reload the LaunchDaemon
+    launchctl unload "$HELPER_PLIST" 2>/dev/null
+    launchctl load -w "$HELPER_PLIST"
+fi
+
+echo "Post-installation complete!"
+exit 0

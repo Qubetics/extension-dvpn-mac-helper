@@ -1,0 +1,29 @@
+# ─────────────────────────────────────────────────────
+# QubeticsVPN .gitignore
+# ─────────────────────────────────────────────────────
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcscmblueprint
+xcuserdata/
+
+# Installer build outputs
+Installer/Root/
+Installer/*.pkg
+Installer/*.pkg.zip
+Installer/*-unsigned.pkg
+
+# Archives
+*.xcarchive
+
+# SwiftPM (if used)
+.build/
+Package.resolved
